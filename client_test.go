@@ -19,7 +19,6 @@ package gnet
 
 import (
 	"math/rand"
-	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -83,7 +82,7 @@ func (ev *clientEvents) OnTick() (delay time.Duration, action Action) {
 }
 
 func TestServeWithGnetClient(t *testing.T) {
-	// start an engine
+	// start a engine
 	// connect 10 clients
 	// each client will pipe random data for 1-3 seconds.
 	// the writes to the engine will be random sizes. 0KB - 1MB.
@@ -267,11 +266,7 @@ func (s *testClientServer) OnTick() (delay time.Duration, action Action) {
 	if atomic.CompareAndSwapInt32(&s.started, 0, 1) {
 		for i := 0; i < s.nclients; i++ {
 			atomic.AddInt32(&s.clientActive, 1)
-			var netConn bool
-			if i%2 == 0 {
-				netConn = true
-			}
-			go startGnetClient(s.tester, s.client, s.clientEV, s.network, s.addr, s.multicore, s.async, netConn)
+			go startGnetClient(s.tester, s.client, s.clientEV, s.network, s.addr, s.multicore, s.async)
 		}
 	}
 	if s.network == "udp" && atomic.LoadInt32(&s.clientActive) == 0 {
@@ -301,11 +296,8 @@ func testServeWithGnetClient(t *testing.T, network, addr string, reuseport, reus
 		WithTicker(true),
 	)
 	assert.NoError(t, err)
-
 	err = ts.client.Start()
 	assert.NoError(t, err)
-	defer ts.client.Stop() //nolint:errcheck
-
 	err = Run(ts,
 		network+"://"+addr,
 		WithLockOSThread(async),
@@ -319,20 +311,9 @@ func testServeWithGnetClient(t *testing.T, network, addr string, reuseport, reus
 	assert.NoError(t, err)
 }
 
-func startGnetClient(t *testing.T, cli *Client, ev *clientEvents, network, addr string, multicore, async, netDial bool) {
+func startGnetClient(t *testing.T, cli *Client, ev *clientEvents, network, addr string, multicore, async bool) {
 	rand.Seed(time.Now().UnixNano())
-	var (
-		c   Conn
-		err error
-	)
-	if netDial {
-		var netConn net.Conn
-		netConn, err = net.Dial(network, addr)
-		require.NoError(t, err)
-		c, err = cli.Enroll(netConn)
-	} else {
-		c, err = cli.Dial(network, addr)
-	}
+	c, err := cli.Dial(network, addr)
 	require.NoError(t, err)
 	defer c.Close()
 	var rspCh chan []byte

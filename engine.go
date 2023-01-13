@@ -234,7 +234,7 @@ func (eng *engine) stop(s Engine) {
 	atomic.StoreInt32(&eng.inShutdown, 1)
 }
 
-func run(eventHandler EventHandler, listener *listener, options *Options, protoAddr string) error {
+func serve(eventHandler EventHandler, listener *listener, options *Options, protoAddr string) error {
 	// Figure out the proper number of event-loops/goroutines to run.
 	numEventLoop := 1
 	if options.Multicore {

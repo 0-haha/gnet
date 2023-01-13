@@ -23,7 +23,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/panjf2000/gnet/v2/internal/math"
+	"github.com/panjf2000/gnet/v2/internal/toolkit"
 	"github.com/panjf2000/gnet/v2/pkg/buffer/ring"
 	"github.com/panjf2000/gnet/v2/pkg/errors"
 	"github.com/panjf2000/gnet/v2/pkg/logging"
@@ -51,10 +51,6 @@ type Engine struct {
 
 // CountConnections counts the number of currently active connections and returns it.
 func (s Engine) CountConnections() (count int) {
-	if s.eng == nil {
-		return -1
-	}
-
 	s.eng.lb.iterate(func(i int, el *eventloop) bool {
 		count += int(el.loadConn())
 		return true
@@ -66,42 +62,12 @@ func (s Engine) CountConnections() (count int) {
 // It is the caller's responsibility to close dupFD when finished.
 // Closing listener does not affect dupFD, and closing dupFD does not affect listener.
 func (s Engine) Dup() (dupFD int, err error) {
-	if s.eng == nil {
-		return -1, errors.ErrEmptyEngine
-	}
-
 	var sc string
 	dupFD, sc, err = s.eng.ln.dup()
 	if err != nil {
 		logging.Warnf("%s failed when duplicating new fd\n", sc)
 	}
 	return
-}
-
-// Stop gracefully shuts down this Engine without interrupting any active event-loops,
-// it waits indefinitely for connections and event-loops to be closed and then shuts down.
-func (s Engine) Stop(ctx context.Context) error {
-	if s.eng == nil {
-		return errors.ErrEmptyEngine
-	}
-	if s.eng.isInShutdown() {
-		return errors.ErrEngineInShutdown
-	}
-
-	s.eng.signalShutdown()
-
-	ticker := time.NewTicker(shutdownPollInterval)
-	defer ticker.Stop()
-	for {
-		if s.eng.isInShutdown() {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
-	}
 }
 
 // Reader is an interface that consists of a number of methods for reading that Conn must implement.
@@ -174,7 +140,7 @@ type Writer interface {
 // AsyncCallback is a callback which will be invoked after the asynchronous functions has finished executing.
 //
 // Note that the parameter gnet.Conn is already released under UDP protocol, thus it's not allowed to be accessed.
-type AsyncCallback func(c Conn, err error) error
+type AsyncCallback func(c Conn) error
 
 // Socket is a set of functions which manipulate the underlying file descriptor of a connection.
 type Socket interface {
@@ -259,7 +225,7 @@ type Conn interface {
 	// Wake triggers a OnTraffic event for the connection.
 	Wake(callback AsyncCallback) (err error)
 
-	// CloseWithCallback closes the current connection, usually you don't need to pass a non-nil callback
+	// Close closes the current connection, usually you don't need to pass a non-nil callback
 	// because you should use OnClose() instead, the callback here is only for compatibility.
 	CloseWithCallback(callback AsyncCallback) (err error)
 
@@ -281,10 +247,11 @@ type (
 		OnShutdown(eng Engine)
 
 		// OnOpen fires when a new connection has been opened.
-		//
-		// The Conn c has information about the connection such as its local and remote addresses.
+		// The Conn c has information about the connection such as it's local and remote address.
 		// The parameter out is the return value which is going to be sent back to the peer.
-		// Sending large amounts of data back to the peer in OnOpen is usually not recommended.
+		// It is usually not recommended to send large amounts of data back to the peer in OnOpened.
+		//
+		// Note that the bytes returned by OnOpened will be sent back to the peer without being encoded.
 		OnOpen(c Conn) (out []byte, action Action)
 
 		// OnClose fires when a connection has been closed.
@@ -293,10 +260,10 @@ type (
 
 		// OnTraffic fires when a socket receives data from the peer.
 		//
-		// Note that the []byte returned from Conn.Peek(int)/Conn.Next(int) is not allowed to be passed to a new goroutine,
-		// as this []byte will be reused within event-loop after OnTraffic() returns.
-		// If you have to use this []byte in a new goroutine, you should either make a copy of it or call Conn.Read([]byte)
-		// to read data into your own []byte, then pass the new []byte to the new goroutine.
+		// Note that the parameter packet returned from React() is not allowed to be passed to a new goroutine,
+		// as this []byte will be reused within event-loop after React() returns.
+		// If you have to use packet in a new goroutine, then you need to make a copy of buf and pass this copy
+		// to that new goroutine.
 		OnTraffic(c Conn) (action Action)
 
 		// OnTick fires immediately after the engine starts and will fire again
@@ -312,35 +279,35 @@ type (
 
 // OnBoot fires when the engine is ready for accepting connections.
 // The parameter engine has information and various utilities.
-func (*BuiltinEventEngine) OnBoot(_ Engine) (action Action) {
+func (es *BuiltinEventEngine) OnBoot(_ Engine) (action Action) {
 	return
 }
 
 // OnShutdown fires when the engine is being shut down, it is called right after
 // all event-loops and connections are closed.
-func (*BuiltinEventEngine) OnShutdown(_ Engine) {
+func (es *BuiltinEventEngine) OnShutdown(_ Engine) {
 }
 
 // OnOpen fires when a new connection has been opened.
 // The parameter out is the return value which is going to be sent back to the peer.
-func (*BuiltinEventEngine) OnOpen(_ Conn) (out []byte, action Action) {
+func (es *BuiltinEventEngine) OnOpen(_ Conn) (out []byte, action Action) {
 	return
 }
 
 // OnClose fires when a connection has been closed.
 // The parameter err is the last known connection error.
-func (*BuiltinEventEngine) OnClose(_ Conn, _ error) (action Action) {
+func (es *BuiltinEventEngine) OnClose(_ Conn, _ error) (action Action) {
 	return
 }
 
 // OnTraffic fires when a local socket receives data from the peer.
-func (*BuiltinEventEngine) OnTraffic(_ Conn) (action Action) {
+func (es *BuiltinEventEngine) OnTraffic(_ Conn) (action Action) {
 	return
 }
 
 // OnTick fires immediately after the engine starts and will fire again
 // following the duration specified by the delay return value.
-func (*BuiltinEventEngine) OnTick() (delay time.Duration, action Action) {
+func (es *BuiltinEventEngine) OnTick() (delay time.Duration, action Action) {
 	return
 }
 
@@ -352,14 +319,13 @@ var MaxStreamBufferCap = 64 * 1024 // 64KB
 // Address should use a scheme prefix and be formatted
 // like `tcp://192.168.0.10:9851` or `unix://socket`.
 // Valid network schemes:
-//
-//	tcp   - bind to both IPv4 and IPv6
-//	tcp4  - IPv4
-//	tcp6  - IPv6
-//	udp   - bind to both IPv4 and IPv6
-//	udp4  - IPv4
-//	udp6  - IPv6
-//	unix  - Unix Domain Socket
+//  tcp   - bind to both IPv4 and IPv6
+//  tcp4  - IPv4
+//  tcp6  - IPv6
+//  udp   - bind to both IPv4 and IPv6
+//  udp4  - IPv4
+//  udp6  - IPv6
+//  unix  - Unix Domain Socket
 //
 // The "tcp" network scheme is assumed when one is not specified.
 func Run(eventHandler EventHandler, protoAddr string, opts ...Option) (err error) {
@@ -403,7 +369,7 @@ func Run(eventHandler EventHandler, protoAddr string, opts ...Option) (err error
 	case rbc <= ring.DefaultBufferSize:
 		options.ReadBufferCap = ring.DefaultBufferSize
 	default:
-		options.ReadBufferCap = math.CeilToPowerOfTwo(rbc)
+		options.ReadBufferCap = toolkit.CeilToPowerOfTwo(rbc)
 	}
 	wbc := options.WriteBufferCap
 	switch {
@@ -412,7 +378,7 @@ func Run(eventHandler EventHandler, protoAddr string, opts ...Option) (err error
 	case wbc <= ring.DefaultBufferSize:
 		options.WriteBufferCap = ring.DefaultBufferSize
 	default:
-		options.WriteBufferCap = math.CeilToPowerOfTwo(wbc)
+		options.WriteBufferCap = toolkit.CeilToPowerOfTwo(wbc)
 	}
 
 	network, addr := parseProtoAddr(protoAddr)
@@ -423,7 +389,7 @@ func Run(eventHandler EventHandler, protoAddr string, opts ...Option) (err error
 	}
 	defer ln.close()
 
-	return run(eventHandler, ln, options, protoAddr)
+	return serve(eventHandler, ln, options, protoAddr)
 }
 
 var (
@@ -435,7 +401,6 @@ var (
 
 // Stop gracefully shuts down the engine without interrupting any active event-loops,
 // it waits indefinitely for connections and event-loops to be closed and then shuts down.
-// Deprecated: The global Stop only shuts down the last registered Engine with the same protocol and IP:Port as the previous Engine's, which can lead to leaks of Engine if you invoke gnet.Run multiple times using the same protocol and IP:Port under the condition that WithReuseAddr(true) and WithReusePort(true) are enabled. Use Engine.Stop instead.
 func Stop(ctx context.Context, protoAddr string) error {
 	var eng *engine
 	if s, ok := allEngines.Load(protoAddr); ok {
