@@ -54,7 +54,7 @@ func (e Engine) Validate() error {
 	if e.eng == nil || len(e.eng.listeners) == 0 {
 		return errors.ErrEmptyEngine
 	}
-	if e.eng.isInShutdown() {
+	if e.eng.isShutdown() {
 		return errors.ErrEngineInShutdown
 	}
 	return nil
@@ -101,7 +101,7 @@ func (e Engine) Stop(ctx context.Context) error {
 	ticker := time.NewTicker(shutdownPollInterval)
 	defer ticker.Stop()
 	for {
-		if e.eng.isInShutdown() {
+		if e.eng.isShutdown() {
 			return nil
 		}
 		select {
@@ -126,7 +126,7 @@ type asyncCmd struct {
 	fd  gfd.GFD
 	typ asyncCmdType
 	cb  AsyncCallback
-	arg interface{}
+	param any
 }
 
 // AsyncWrite writes data to the given connection asynchronously.
@@ -135,7 +135,7 @@ func (e Engine) AsyncWrite(fd gfd.GFD, p []byte, cb AsyncCallback) error {
 		return err
 	}
 
-	return e.eng.sendCmd(&asyncCmd{fd: fd, typ: asyncCmdWrite, cb: cb, arg: p}, false)
+	return e.eng.sendCmd(&asyncCmd{fd: fd, typ: asyncCmdWrite, cb: cb, param: p}, false)
 }
 
 // AsyncWritev is like AsyncWrite, but it accepts a slice of byte slices.
@@ -144,7 +144,7 @@ func (e Engine) AsyncWritev(fd gfd.GFD, batch [][]byte, cb AsyncCallback) error 
 		return err
 	}
 
-	return e.eng.sendCmd(&asyncCmd{fd: fd, typ: asyncCmdWritev, cb: cb, arg: batch}, false)
+	return e.eng.sendCmd(&asyncCmd{fd: fd, typ: asyncCmdWritev, cb: cb, param: batch}, false)
 }
 
 // Close closes the given connection.
@@ -237,9 +237,12 @@ type Writer interface {
 	AsyncWritev(bs [][]byte, callback AsyncCallback) (err error)
 }
 
-// AsyncCallback is a callback which will be invoked after the asynchronous functions has finished executing.
+// AsyncCallback is a callback that will be invoked after the asynchronous function finishes.
 //
-// Note that the parameter gnet.Conn is already released under UDP protocol, thus it's not allowed to be accessed.
+// Note that the parameter gnet.Conn might have been already released when it's UDP protocol,
+// thus it shouldn't be accessed.
+// This callback will be executed in event-loop, thus it must not block, otherwise,
+// it blocks the event-loop.
 type AsyncCallback func(c Conn, err error) error
 
 // Socket is a set of functions which manipulate the underlying file descriptor of a connection.
@@ -303,11 +306,11 @@ type Conn interface {
 
 	// Context returns a user-defined context, it's not concurrency-safe,
 	// you must invoke it within any method in EventHandler.
-	Context() (ctx interface{})
+	Context() (ctx any)
 
 	// SetContext sets a user-defined context, it's not concurrency-safe,
 	// you must invoke it within any method in EventHandler.
-	SetContext(ctx interface{})
+	SetContext(ctx any)
 
 	// LocalAddr is the connection's local socket address, it's not concurrency-safe,
 	// you must invoke it within any method in EventHandler.
@@ -441,6 +444,13 @@ func createListeners(addrs []string, opts ...Option) ([]*listener, *Options, err
 		logging.Errorf("too many event-loops under LockOSThread mode, should be less than 10,000 "+
 			"while you are trying to set up %d\n", options.NumEventLoop)
 		return nil, nil, errors.ErrTooManyEventLoopThreads
+	}
+
+	if options.EdgeTriggeredIOChunk > 0 {
+		options.EdgeTriggeredIO = true
+		options.EdgeTriggeredIOChunk = math.CeilToPowerOfTwo(options.EdgeTriggeredIOChunk)
+	} else if options.EdgeTriggeredIO {
+		options.EdgeTriggeredIOChunk = 1 << 20 // 1MB
 	}
 
 	rbc := options.ReadBufferCap
@@ -589,14 +599,14 @@ func Stop(ctx context.Context, protoAddr string) error {
 		return errors.ErrEngineInShutdown
 	}
 
-	if eng.isInShutdown() {
+	if eng.isShutdown() {
 		return errors.ErrEngineInShutdown
 	}
 
 	ticker := time.NewTicker(shutdownPollInterval)
 	defer ticker.Stop()
 	for {
-		if eng.isInShutdown() {
+		if eng.isShutdown() {
 			return nil
 		}
 		select {
